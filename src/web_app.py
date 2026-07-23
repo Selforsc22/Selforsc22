@@ -54,8 +54,12 @@ def init_scanner():
         socketio.emit('threat_alert', device.to_dict())
         logger.warning(f"THREAT ALERT: {device.matched_signature.name if device.matched_signature else 'Unknown'} detected!")
 
+    def on_canary_status_changed(all_clear: bool):
+        socketio.emit('canary_status', {'all_clear': all_clear})
+
     scanner.on_device_detected = on_device_detected
     scanner.on_threat_detected = on_threat_detected
+    scanner.on_canary_status_changed = on_canary_status_changed
 
 
 def run_async_scanner():
@@ -185,6 +189,134 @@ def export_csv():
 
     path = device_logger.export_to_csv()
     return jsonify({'success': True, 'path': str(path)})
+
+
+@app.route('/api/settings', methods=['GET'])
+def get_settings():
+    """Get current scanner settings"""
+    if not scanner:
+        return jsonify({'error': 'Scanner not initialized'}), 500
+
+    return jsonify({
+        'rssi_threshold': scanner.rssi_threshold,
+        'notification_cooldown': scanner.notification_cooldown,
+        'custom_manufacturer_ids': [f'0x{id:04X}' for id in scanner.custom_manufacturer_ids],
+        'debug_mode': scanner._debug_mode,
+        'canary_status': scanner.get_canary_status()
+    })
+
+
+@app.route('/api/settings', methods=['POST'])
+def update_settings():
+    """Update scanner settings"""
+    if not scanner:
+        return jsonify({'error': 'Scanner not initialized'}), 500
+
+    data = request.get_json()
+
+    if 'rssi_threshold' in data:
+        scanner.rssi_threshold = int(data['rssi_threshold'])
+        logger.info(f"RSSI threshold set to {scanner.rssi_threshold}")
+
+    if 'notification_cooldown' in data:
+        scanner.notification_cooldown = float(data['notification_cooldown'])
+        logger.info(f"Notification cooldown set to {scanner.notification_cooldown}s")
+
+    if 'debug_mode' in data:
+        scanner.set_debug_mode(bool(data['debug_mode']))
+
+    if 'custom_manufacturer_ids' in data:
+        # Accept hex strings like "0x01AB" or integers
+        ids = []
+        for id_val in data['custom_manufacturer_ids']:
+            if isinstance(id_val, str):
+                ids.append(int(id_val, 16))
+            else:
+                ids.append(int(id_val))
+        scanner.set_custom_manufacturer_ids(ids)
+
+    return jsonify({'success': True, 'message': 'Settings updated'})
+
+
+@app.route('/api/settings/custom_id', methods=['POST'])
+def add_custom_id():
+    """Add a single custom manufacturer ID"""
+    if not scanner:
+        return jsonify({'error': 'Scanner not initialized'}), 500
+
+    data = request.get_json()
+    id_val = data.get('manufacturer_id')
+
+    if id_val is None:
+        return jsonify({'error': 'manufacturer_id required'}), 400
+
+    if isinstance(id_val, str):
+        id_val = int(id_val, 16)
+    else:
+        id_val = int(id_val)
+
+    scanner.add_custom_manufacturer_id(id_val)
+    return jsonify({'success': True, 'added_id': f'0x{id_val:04X}'})
+
+
+@app.route('/api/canary')
+def get_canary_status():
+    """Get canary mode status (all clear / threat nearby)"""
+    if not scanner:
+        return jsonify({'error': 'Scanner not initialized'}), 500
+
+    return jsonify({
+        'all_clear': scanner.get_canary_status(),
+        'status': 'ALL CLEAR' if scanner.get_canary_status() else 'THREAT NEARBY'
+    })
+
+
+@app.route('/api/debug/log')
+def get_debug_log():
+    """Get debug log entries"""
+    if not scanner:
+        return jsonify({'error': 'Scanner not initialized'}), 500
+
+    return jsonify({'log': scanner.get_debug_log()})
+
+
+@app.route('/api/debug/log/export')
+def export_debug_log():
+    """Export debug log as text"""
+    if not scanner:
+        return jsonify({'error': 'Scanner not initialized'}), 500
+
+    return scanner.export_debug_log(), 200, {'Content-Type': 'text/plain'}
+
+
+@app.route('/api/debug/log/clear', methods=['POST'])
+def clear_debug_log():
+    """Clear debug log"""
+    if not scanner:
+        return jsonify({'error': 'Scanner not initialized'}), 500
+
+    scanner.clear_debug_log()
+    return jsonify({'success': True, 'message': 'Debug log cleared'})
+
+
+@app.route('/api/surveillance/report')
+def get_surveillance_report():
+    """Get surveillance pattern analysis report"""
+    if not device_logger:
+        return jsonify({'error': 'Logger not initialized'}), 500
+
+    report = device_logger.get_surveillance_report()
+    return jsonify(report)
+
+
+@app.route('/api/device/<address>/patterns')
+def get_device_patterns(address):
+    """Get pattern analysis for a specific device"""
+    if not device_logger:
+        return jsonify({'error': 'Logger not initialized'}), 500
+
+    patterns = device_logger.get_device_patterns(address)
+    return jsonify(patterns)
 
 
 # WebSocket events

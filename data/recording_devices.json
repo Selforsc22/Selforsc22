@@ -1,10 +1,34 @@
 {
-  "version": "2.0.0",
-  "last_updated": "2026-06-01",
+  "version": "2.1.0",
+  "last_updated": "2026-07-23",
   "description": "Database of known Bluetooth-enabled recording devices",
   "source": "Based on research from Nearby Glasses app, Bluehood, and Bluetooth SIG assigned numbers",
   "notes": "BLE manufacturer IDs are assigned by Bluetooth SIG and are mandatory/standardized. They cannot be spoofed without breaking Bluetooth compliance.",
   "devices": [
+    {
+      "id": "heycyan_sdk_glasses",
+      "name": "HeyCyan SDK Smart Glasses",
+      "manufacturer": "Various (HeyCyan SDK)",
+      "type": "smart_glasses",
+      "has_camera": true,
+      "has_microphone": true,
+      "threat_level": "high",
+      "identifiers": {
+        "name_patterns": [
+          "HeyCyan",
+          "HCY"
+        ],
+        "manufacturer_prefixes": [],
+        "ble_manufacturer_ids": [1494],
+        "ble_manufacturer_ids_info": {
+          "1494": "0x05D6 - Zhuhai Jieli Technology Co., Ltd (HeyCyan chip provider)"
+        },
+        "service_uuids": [
+          "7905fff0-b5ce-4e99-a40f-4b1e122d00d0"
+        ]
+      },
+      "notes": "HeyCyan is an SDK used by multiple Chinese smart glasses brands. The primary UUID (7905FFF0-B5CE-4E99-A40F-4B1E122D00D0) is fixed and detectable. Manufacturer ID 0x05D6 is Zhuhai Jieli Technology."
+    },
     {
       "id": "meta_smart_glasses",
       "name": "Meta Smart Glasses (Ray-Ban/Oakley)",

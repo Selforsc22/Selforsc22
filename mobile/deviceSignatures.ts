@@ -35,6 +35,7 @@ export const BLE_MANUFACTURER_IDS = {
   META_TECHNOLOGIES: 0x058e, // 1422 - Meta Platforms Technologies, LLC
   LUXOTTICA: 0x0d53, // 3411 - Luxottica Group (Ray-Ban)
   SNAP: 0x03c2, // 962 - Snap Inc. (Spectacles)
+  HEYCYAN_JIELI: 0x05d6, // 1494 - Zhuhai Jieli Technology (HeyCyan SDK)
   AMAZON: 0x00ab, // 171 - Amazon
   GOOGLE: 0x00e0, // 224 - Google
   GOPRO: 0x028e, // 654 - GoPro
@@ -47,11 +48,27 @@ export const BLE_MANUFACTURER_IDS = {
   SAMSUNG: 0x0075, // 117 - Samsung (for filtering)
 } as const;
 
+// HeyCyan SDK primary UUID - used by many Chinese smart glasses brands
+export const HEYCYAN_SERVICE_UUID = '7905fff0-b5ce-4e99-a40f-4b1e122d00d0';
+
 /**
  * Known recording devices database
  * Detection priority: manufacturer_id > mac_prefix > name_pattern > service_uuid
  */
 export const KNOWN_DEVICES: DeviceSignature[] = [
+  {
+    id: 'heycyan_sdk_glasses',
+    name: 'HeyCyan SDK Smart Glasses',
+    manufacturer: 'Various (HeyCyan SDK)',
+    type: 'smart_glasses',
+    has_camera: true,
+    has_microphone: true,
+    threat_level: 'high',
+    name_patterns: ['heycyan', 'hcy'],
+    manufacturer_prefixes: [],
+    ble_manufacturer_ids: [BLE_MANUFACTURER_IDS.HEYCYAN_JIELI],
+    service_uuids: [HEYCYAN_SERVICE_UUID],
+  },
   {
     id: 'meta_smart_glasses',
     name: 'Meta Smart Glasses (Ray-Ban/Oakley)',

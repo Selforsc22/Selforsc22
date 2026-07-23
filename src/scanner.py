@@ -191,19 +191,104 @@ class BluetoothScanner:
 
     # Default RSSI threshold for threat alerts (-75 dBm ~ 10-15m outdoors, 3-10m indoors)
     DEFAULT_RSSI_THRESHOLD = -75
+    # Default notification cooldown in seconds (don't re-alert same device within this time)
+    DEFAULT_NOTIFICATION_COOLDOWN = 10.0
 
     def __init__(self, device_db: Optional[RecordingDeviceDatabase] = None,
-                 rssi_threshold: int = DEFAULT_RSSI_THRESHOLD):
+                 rssi_threshold: int = DEFAULT_RSSI_THRESHOLD,
+                 notification_cooldown: float = DEFAULT_NOTIFICATION_COOLDOWN,
+                 custom_manufacturer_ids: Optional[list[int]] = None):
         self.device_db = device_db or RecordingDeviceDatabase()
         self.detected_devices: dict[str, DetectedDevice] = {}
         self.scanning = False
         self._scan_task: Optional[asyncio.Task] = None
         self.on_device_detected: Optional[Callable[[DetectedDevice], None]] = None
         self.on_threat_detected: Optional[Callable[[DetectedDevice], None]] = None
+        self.on_canary_status_changed: Optional[Callable[[bool], None]] = None  # Canary mode callback
         self.rssi_threshold = rssi_threshold  # Only alert for devices stronger than this
+        self.notification_cooldown = notification_cooldown  # Seconds between alerts for same device
+        self.custom_manufacturer_ids = custom_manufacturer_ids or []  # User-defined manufacturer IDs
+        self._last_alert_times: dict[str, datetime] = {}  # Track last alert time per device
+        self._canary_status = True  # True = all clear, False = threat nearby
+        self._debug_mode = False  # Show all scan details
+        self._debug_log: list[dict] = []  # Store debug entries
 
         if not BLEAK_AVAILABLE:
             logger.warning("Bleak library not available - running in simulation mode")
+
+    def set_custom_manufacturer_ids(self, ids: list[int]):
+        """Set custom manufacturer IDs to detect (user-defined threats)"""
+        self.custom_manufacturer_ids = ids
+        logger.info(f"Custom manufacturer IDs set: {[f'0x{id:04X}' for id in ids]}")
+
+    def add_custom_manufacturer_id(self, manufacturer_id: int):
+        """Add a single custom manufacturer ID"""
+        if manufacturer_id not in self.custom_manufacturer_ids:
+            self.custom_manufacturer_ids.append(manufacturer_id)
+            logger.info(f"Added custom manufacturer ID: 0x{manufacturer_id:04X}")
+
+    def set_debug_mode(self, enabled: bool):
+        """Enable/disable debug mode for verbose logging"""
+        self._debug_mode = enabled
+        logger.info(f"Debug mode {'enabled' if enabled else 'disabled'}")
+
+    def get_debug_log(self) -> list[dict]:
+        """Get debug log entries"""
+        return self._debug_log.copy()
+
+    def export_debug_log(self) -> str:
+        """Export debug log as formatted text"""
+        lines = ["VisionFinder Debug Log", "=" * 50, ""]
+        for entry in self._debug_log:
+            lines.append(f"[{entry['timestamp']}] {entry['type']}: {entry['message']}")
+            if entry.get('details'):
+                for key, value in entry['details'].items():
+                    lines.append(f"  {key}: {value}")
+            lines.append("")
+        return "\n".join(lines)
+
+    def clear_debug_log(self):
+        """Clear the debug log"""
+        self._debug_log.clear()
+
+    def _log_debug(self, log_type: str, message: str, details: Optional[dict] = None):
+        """Add entry to debug log"""
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "type": log_type,
+            "message": message,
+            "details": details or {}
+        }
+        self._debug_log.append(entry)
+        # Keep log size reasonable
+        if len(self._debug_log) > 1000:
+            self._debug_log = self._debug_log[-500:]
+
+    def get_canary_status(self) -> bool:
+        """Get canary mode status (True = all clear, False = threat detected)"""
+        return self._canary_status
+
+    def _update_canary_status(self, threat_nearby: bool):
+        """Update canary status and notify if changed"""
+        new_status = not threat_nearby
+        if new_status != self._canary_status:
+            self._canary_status = new_status
+            if self.on_canary_status_changed:
+                self.on_canary_status_changed(new_status)
+            logger.info(f"Canary status: {'ALL CLEAR' if new_status else 'THREAT NEARBY'}")
+
+    def _should_alert(self, device_address: str) -> bool:
+        """Check if we should alert for this device (respects cooldown)"""
+        now = datetime.now()
+        last_alert = self._last_alert_times.get(device_address)
+        if last_alert is None:
+            return True
+        elapsed = (now - last_alert).total_seconds()
+        return elapsed >= self.notification_cooldown
+
+    def _record_alert(self, device_address: str):
+        """Record that we alerted for this device"""
+        self._last_alert_times[device_address] = datetime.now()
 
     def _process_device(self, device: 'BLEDevice', advertisement_data: 'AdvertisementData'):
         """Process a detected BLE device"""
@@ -265,34 +350,84 @@ class BluetoothScanner:
     def _check_for_threat(self, device: DetectedDevice, service_uuids: list[str]) -> bool:
         """
         Check if a device matches known recording device signatures.
-        Returns True if a threat was detected within RSSI threshold.
+        Returns True if a threat was detected within RSSI threshold and cooldown allows.
         """
-        match = self.device_db.match_device(
-            device.name,
-            device.address,
-            service_uuids,
-            device.manufacturer_data
-        )
+        # First check custom manufacturer IDs (user-defined)
+        custom_match = False
+        if self.custom_manufacturer_ids and device.manufacturer_data:
+            for mfr_id in device.manufacturer_data.keys():
+                if mfr_id in self.custom_manufacturer_ids:
+                    custom_match = True
+                    device.is_potential_threat = True
+                    device.threat_level = "high"
+                    # Create a synthetic signature for custom matches
+                    device.matched_signature = DeviceSignature(
+                        id="custom_device",
+                        name=f"Custom Device (0x{mfr_id:04X})",
+                        manufacturer="User-defined",
+                        device_type="unknown",
+                        has_camera=True,
+                        has_microphone=True,
+                        threat_level="high",
+                        notes="Matched by user-defined manufacturer ID"
+                    )
+                    logger.info(f"Matched custom manufacturer ID 0x{mfr_id:04X} for {device.address}")
+                    break
 
-        if match:
-            device.matched_signature = match
-            device.is_potential_threat = True
-            device.threat_level = match.threat_level
+        # Check against known device database
+        if not custom_match:
+            match = self.device_db.match_device(
+                device.name,
+                device.address,
+                service_uuids,
+                device.manufacturer_data
+            )
 
-            # Log detection method for debugging
+            if match:
+                device.matched_signature = match
+                device.is_potential_threat = True
+                device.threat_level = match.threat_level
+
+        # Log debug info if enabled
+        if self._debug_mode:
+            mfr_ids = [f"0x{k:04X}" for k in device.manufacturer_data.keys()] if device.manufacturer_data else []
+            self._log_debug("SCAN", f"Device: {device.name or 'Unknown'}", {
+                "address": device.address,
+                "rssi": device.rssi,
+                "manufacturer_ids": mfr_ids,
+                "service_uuids": service_uuids,
+                "is_threat": device.is_potential_threat
+            })
+
+        if device.is_potential_threat:
             mfr_ids = [f"0x{k:04X}" for k in device.manufacturer_data.keys()] if device.manufacturer_data else []
             distance = device._estimate_distance(device.rssi)
+            match_name = device.matched_signature.name if device.matched_signature else "Unknown"
+
+            # Update canary status
+            self._update_canary_status(threat_nearby=True)
 
             # Only trigger high-priority alert if within RSSI threshold
             if device.rssi >= self.rssi_threshold:
-                logger.warning(
-                    f"THREAT DETECTED: {match.name} at {device.address} "
-                    f"(name='{device.name}', mfr_ids={mfr_ids}, rssi={device.rssi}dBm, distance={distance})"
-                )
-                return True
+                # Check notification cooldown
+                if self._should_alert(device.address):
+                    self._record_alert(device.address)
+                    logger.warning(
+                        f"THREAT DETECTED: {match_name} at {device.address} "
+                        f"(name='{device.name}', mfr_ids={mfr_ids}, rssi={device.rssi}dBm, distance={distance})"
+                    )
+                    self._log_debug("THREAT", f"Alert triggered: {match_name}", {
+                        "address": device.address,
+                        "rssi": device.rssi,
+                        "distance": distance
+                    })
+                    return True
+                else:
+                    logger.debug(f"Threat {device.address} within cooldown period, skipping alert")
+                    return False
             else:
                 logger.info(
-                    f"Threat detected but distant: {match.name} at {device.address} "
+                    f"Threat detected but distant: {match_name} at {device.address} "
                     f"(rssi={device.rssi}dBm < threshold={self.rssi_threshold}dBm)"
                 )
                 return False
@@ -362,21 +497,23 @@ class BluetoothScanner:
         import random
 
         # Simulated devices: (address, name, rssi, manufacturer_data)
-        # 0x0969 (2409) = Woan Technology (Meta glasses manufacturer)
+        # 0x01AB (427) = Meta Platforms, Inc.
+        # 0x03C2 (962) = Snap Inc.
+        # 0x05D6 (1494) = Zhuhai Jieli Technology (HeyCyan)
         # 0x004C (76) = Apple
         # 0x0075 (117) = Samsung
         simulated_devices = [
             ("AA:BB:CC:DD:EE:01", "iPhone", -65, {76: b'\x10\x05\x03'}),
             ("AA:BB:CC:DD:EE:02", "Galaxy Watch", -70, {117: b'\x42\x04\x01'}),
             ("AA:BB:CC:DD:EE:03", "AirPods Pro", -55, {76: b'\x07\x19\x01'}),
-            ("E4:F0:42:11:22:33", "Ray-Ban | Meta", -45, {2409: b'\x01\x00\x00'}),  # Meta glasses - paired name
-            ("AA:BB:CC:DD:EE:08", "Woan", -42, {2409: b'\x01\x00\x00'}),  # Meta glasses - unpaired (shows as Woan)
+            ("E4:F0:42:11:22:33", "Ray-Ban | Meta", -45, {427: b'\x01\x00\x00'}),  # Meta glasses (0x01AB)
+            ("AA:BB:CC:DD:EE:08", "Spectacles", -42, {962: b'\x01\x00\x00'}),  # Snap Spectacles (0x03C2)
             ("AA:BB:CC:DD:EE:04", "Fitbit", -80, {}),
             ("AA:BB:CC:DD:EE:05", "Unknown Device", -90, {}),
-            ("AA:BB:CC:DD:EE:06", "Spectacles", -60, {}),  # Snapchat Spectacles
+            ("AA:BB:CC:DD:EE:06", "HeyCyan", -60, {1494: b'\x01\x00\x00'}),  # HeyCyan SDK glasses (0x05D6)
             ("AA:BB:CC:DD:EE:07", "MacBook Pro", -75, {76: b'\x10\x06\x11'}),
-            ("D4:D9:19:AA:BB:CC", "GoPro HERO12", -50, {}),  # GoPro - matched by MAC prefix
-            ("AA:BB:CC:DD:EE:09", "Oakley", -48, {2409: b'\x02\x00\x00'}),  # Oakley Meta glasses
+            ("D4:D9:19:AA:BB:CC", "GoPro HERO12", -50, {654: b'\x01\x00\x00'}),  # GoPro (0x028E)
+            ("AA:BB:CC:DD:EE:09", "Oakley Meta", -48, {427: b'\x02\x00\x00'}),  # Oakley Meta glasses (0x01AB)
         ]
 
         logger.info("Starting simulated continuous scan")
@@ -418,7 +555,9 @@ class BluetoothScanner:
     def _get_simulated_devices(self) -> list[DetectedDevice]:
         """Return simulated devices for testing"""
         now = datetime.now()
-        # 0x0969 (2409) = Woan Technology (Meta glasses manufacturer)
+        # 0x01AB (427) = Meta Platforms, Inc.
+        # 0x03C2 (962) = Snap Inc.
+        # 0x05D6 (1494) = Zhuhai Jieli Technology (HeyCyan)
         simulated = [
             DetectedDevice(
                 address="AA:BB:CC:DD:EE:01",
@@ -434,15 +573,15 @@ class BluetoothScanner:
                 rssi=-45,
                 first_seen=now,
                 last_seen=now,
-                manufacturer_data={2409: b'\x01\x00\x00'},  # Woan/Meta
+                manufacturer_data={427: b'\x01\x00\x00'},  # Meta (0x01AB)
             ),
             DetectedDevice(
                 address="AA:BB:CC:DD:EE:08",
-                name="Woan",  # Unpaired Meta glasses show as "Woan"
+                name="HeyCyan Glasses",
                 rssi=-50,
                 first_seen=now,
                 last_seen=now,
-                manufacturer_data={2409: b'\x01\x00\x00'},  # Woan/Meta
+                manufacturer_data={1494: b'\x01\x00\x00'},  # HeyCyan (0x05D6)
             ),
         ]
 
