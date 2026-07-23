@@ -1,6 +1,9 @@
 """
 Flask Web Application for Bluetooth Scanner
 Provides a web UI for monitoring and managing the scanner
+
+Uses threading mode with simple-websocket for WebSocket support.
+Eventlet is deprecated; this uses the recommended threading approach.
 """
 
 import asyncio
@@ -29,7 +32,9 @@ app = Flask(__name__,
             static_folder=str(Path(__file__).parent.parent / "static"))
 app.config['SECRET_KEY'] = 'bluetooth-scanner-secret-key-change-in-production'
 
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+# Use threading mode with simple-websocket (replaces deprecated eventlet)
+# Falls back to gevent if simple-websocket is not available
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
 # Global scanner and logger instances
 scanner: BluetoothScanner = None
